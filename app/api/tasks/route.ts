@@ -1,18 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { initDatabase, getAllTasks, createTask, updateTask, deleteTask, startTask, completeTask, addTaskLog, updateTaskLog, deleteTaskLog } from '@/lib/database';
 
-// Initialize database on module load
-let dbInitialized = false;
-const ensureDbInitialized = async () => {
-  if (!dbInitialized) {
-    await initDatabase();
-    dbInitialized = true;
-  }
-};
+// No database initialization needed for Supabase
 
 export async function GET(request: NextRequest) {
   try {
-    await ensureDbInitialized();
     const tasks = await getAllTasks();
     return NextResponse.json({ success: true, data: tasks });
   } catch (error) {
@@ -26,7 +18,6 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    await ensureDbInitialized();
     const url = new URL(request.url);
     const action = url.searchParams.get('action');
     const taskId = url.searchParams.get('id');
@@ -90,7 +81,6 @@ export async function POST(request: NextRequest) {
 
 export async function PUT(request: NextRequest) {
   try {
-    await ensureDbInitialized();
     const url = new URL(request.url);
     const action = url.searchParams.get('action');
     const taskId = url.searchParams.get('id');
@@ -134,7 +124,6 @@ export async function PUT(request: NextRequest) {
 
 export async function DELETE(request: NextRequest) {
   try {
-    await ensureDbInitialized();
     const url = new URL(request.url);
     const action = url.searchParams.get('action');
     const taskId = url.searchParams.get('id');

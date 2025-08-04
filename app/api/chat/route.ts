@@ -90,11 +90,11 @@ Take appropriate actions to help the user.`
     // Compositional function calling loop - allows chaining multiple function calls
     let allFunctionCalls: any[] = [];
     let allFunctionResults: any[] = [];
-    
+
     // Loop until the model has no more function calls to make
     while (true) {
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-2.5-flash-lite',
         contents,
         config
       });
@@ -103,7 +103,7 @@ Take appropriate actions to help the user.`
       if (response.functionCalls && response.functionCalls.length > 0) {
         // Store function calls for final response
         allFunctionCalls.push(...response.functionCalls);
-        
+
         // Execute all function calls in this turn
         const currentTurnResults = [];
         for (const functionCall of response.functionCalls) {
@@ -165,7 +165,7 @@ Take appropriate actions to help the user.`
           };
 
           const enhancedResponse = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
+            model: 'gemini-2.5-flash-lite',
             contents: [...contents, enhancedResponsePrompt],
             config: {
               temperature: 0.7,

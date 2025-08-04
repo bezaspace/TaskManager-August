@@ -1,4 +1,4 @@
-import { initializeSQLiteDatabase, migrateFromJSON, DatabaseConnection } from './sqlite-setup';
+import { supabase, TaskRow, TaskInsert, TaskUpdate, TaskLogRow, TaskLogInsert, TaskLogUpdate } from './supabase';
 
 export interface Task {
   id: string;
@@ -24,236 +24,205 @@ export interface TaskWithLogs extends Task {
   logs: TaskLog[];
 }
 
+// Helper functions to convert between database format and API format
+function dbTaskToTask(dbTask: TaskRow): Task {
+  return {
+    id: dbTask.id,
+    title: dbTask.title,
+    description: dbTask.description,
+    status: dbTask.status,
+    startTime: dbTask.start_time,
+    scheduledStartTime: dbTask.scheduled_start_time || undefined,
+    scheduledEndTime: dbTask.scheduled_end_time || undefined,
+    completedTime: dbTask.completed_time || undefined,
+    elapsedTime: dbTask.elapsed_time,
+  };
+}
+
+function taskToDbTask(task: Task): TaskInsert {
+  return {
+    id: task.id,
+    title: task.title,
+    description: task.description,
+    status: task.status,
+    start_time: task.startTime,
+    scheduled_start_time: task.scheduledStartTime || null,
+    scheduled_end_time: task.scheduledEndTime || null,
+    completed_time: task.completedTime || null,
+    elapsed_time: task.elapsedTime,
+  };
+}
+
+function dbLogToTaskLog(dbLog: TaskLogRow): TaskLog {
+  return {
+    id: dbLog.id,
+    taskId: dbLog.task_id,
+    message: dbLog.message,
+    timestamp: dbLog.timestamp,
+    isEditable: dbLog.is_editable ? 1 : 0,
+  };
+}
+
+function taskLogToDbLog(log: TaskLog): TaskLogInsert {
+  return {
+    id: log.id,
+    task_id: log.taskId,
+    message: log.message,
+    timestamp: log.timestamp,
+    is_editable: log.isEditable === 1,
+  };
+}
+
 class TaskDatabase {
-  private connection: DatabaseConnection | null = null;
-
-  constructor() {
-    this.initializeDatabase();
-  }
-
-  private async initializeDatabase() {
-    try {
-      this.connection = await initializeSQLiteDatabase();
-      await migrateFromJSON(this.connection);
-    } catch (error) {
-      console.error('Error initializing database:', error);
-      throw error;
-    }
-  }
-
-  private async ensureConnection(): Promise<DatabaseConnection> {
-    if (!this.connection) {
-      this.connection = await initializeSQLiteDatabase();
-    }
-    return this.connection;
-  }
-
   // Task operations
   async createTask(task: Task): Promise<Task> {
-    const connection = await this.ensureConnection();
+    const dbTask = taskToDbTask(task);
+    const { data, error } = await supabase
+      .from('tasks')
+      .insert(dbTask)
+      .select()
+      .single();
 
-    return new Promise((resolve, reject) => {
-      const stmt = connection.db.prepare(`
-        INSERT INTO tasks (id, title, description, status, startTime, scheduledStartTime, scheduledEndTime, completedTime, elapsedTime)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+    if (error) {
+      throw new Error(`Failed to create task: ${error.message}`);
+    }
 
-      stmt.run([
-        task.id,
-        task.title,
-        task.description,
-        task.status,
-        task.startTime,
-        task.scheduledStartTime || null,
-        task.scheduledEndTime || null,
-        task.completedTime || null,
-        task.elapsedTime
-      ], function (err) {
-        stmt.finalize();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(task);
-        }
-      });
-    });
+    return dbTaskToTask(data);
   }
 
   async getAllTasksWithLogs(): Promise<TaskWithLogs[]> {
-    const connection = await this.ensureConnection();
+    const { data: tasks, error } = await supabase
+      .from('tasks')
+      .select(`
+        *,
+        task_logs (*)
+      `)
+      .order('start_time', { ascending: false });
 
-    return new Promise((resolve, reject) => {
-      connection.db.all(`
-        SELECT * FROM tasks 
-        ORDER BY startTime DESC
-      `, async (err, tasks: any[]) => {
-        if (err) {
-          reject(err);
-          return;
-        }
+    if (error) {
+      throw new Error(`Failed to fetch tasks: ${error.message}`);
+    }
 
-        try {
-          const tasksWithLogs = await Promise.all(
-            tasks.map(async task => ({
-              ...task,
-              logs: await this.getTaskLogs(task.id)
-            }))
-          );
-          resolve(tasksWithLogs);
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
+    return tasks.map(task => ({
+      ...dbTaskToTask(task),
+      logs: (task.task_logs || []).map(dbLogToTaskLog).sort((a, b) => 
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      )
+    }));
   }
 
   async getTaskById(id: string): Promise<Task | null> {
-    const connection = await this.ensureConnection();
+    const { data, error } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', id)
+      .single();
 
-    return new Promise((resolve, reject) => {
-      connection.db.get(`
-        SELECT * FROM tasks WHERE id = ?
-      `, [id], (err, task: any) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(task || null);
-        }
-      });
-    });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null; // No rows found
+      }
+      throw new Error(`Failed to fetch task: ${error.message}`);
+    }
+
+    return dbTaskToTask(data);
   }
 
   async updateTask(id: string, updates: Partial<Task>): Promise<boolean> {
-    const connection = await this.ensureConnection();
+    if (Object.keys(updates).length === 0) {
+      return false;
+    }
 
-    return new Promise((resolve, reject) => {
-      // Build dynamic UPDATE query based on provided updates
-      const fields = Object.keys(updates).filter(key => updates[key as keyof Task] !== undefined);
-      if (fields.length === 0) {
-        resolve(false);
-        return;
-      }
+    // Convert updates to database format
+    const dbUpdates: Partial<TaskUpdate> = {};
+    if (updates.title !== undefined) dbUpdates.title = updates.title;
+    if (updates.description !== undefined) dbUpdates.description = updates.description;
+    if (updates.status !== undefined) dbUpdates.status = updates.status;
+    if (updates.startTime !== undefined) dbUpdates.start_time = updates.startTime;
+    if (updates.scheduledStartTime !== undefined) dbUpdates.scheduled_start_time = updates.scheduledStartTime || null;
+    if (updates.scheduledEndTime !== undefined) dbUpdates.scheduled_end_time = updates.scheduledEndTime || null;
+    if (updates.completedTime !== undefined) dbUpdates.completed_time = updates.completedTime || null;
+    if (updates.elapsedTime !== undefined) dbUpdates.elapsed_time = updates.elapsedTime;
 
-      const setClause = fields.map(field => `${field} = ?`).join(', ');
-      const values = fields.map(field => updates[field as keyof Task]);
-      values.push(id);
+    const { error } = await supabase
+      .from('tasks')
+      .update(dbUpdates)
+      .eq('id', id);
 
-      const stmt = connection.db.prepare(`
-        UPDATE tasks SET ${setClause} WHERE id = ?
-      `);
+    if (error) {
+      throw new Error(`Failed to update task: ${error.message}`);
+    }
 
-      stmt.run(values, function (err) {
-        stmt.finalize();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(this.changes > 0);
-        }
-      });
-    });
+    return true;
   }
 
   async deleteTask(id: string): Promise<boolean> {
-    const connection = await this.ensureConnection();
+    const { error } = await supabase
+      .from('tasks')
+      .delete()
+      .eq('id', id);
 
-    return new Promise((resolve, reject) => {
-      // SQLite will handle CASCADE deletion of logs due to foreign key constraint
-      const stmt = connection.db.prepare(`
-        DELETE FROM tasks WHERE id = ?
-      `);
+    if (error) {
+      throw new Error(`Failed to delete task: ${error.message}`);
+    }
 
-      stmt.run([id], function (err) {
-        stmt.finalize();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(this.changes > 0);
-        }
-      });
-    });
+    return true;
   }
 
   // Task log operations
   async getTaskLogs(taskId: string): Promise<TaskLog[]> {
-    const connection = await this.ensureConnection();
+    const { data, error } = await supabase
+      .from('task_logs')
+      .select('*')
+      .eq('task_id', taskId)
+      .order('timestamp', { ascending: true });
 
-    return new Promise((resolve, reject) => {
-      connection.db.all(`
-        SELECT * FROM task_logs 
-        WHERE taskId = ? 
-        ORDER BY timestamp ASC
-      `, [taskId], (err, logs: any[]) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(logs || []);
-        }
-      });
-    });
+    if (error) {
+      throw new Error(`Failed to fetch task logs: ${error.message}`);
+    }
+
+    return data.map(dbLogToTaskLog);
   }
 
   async addTaskLog(log: TaskLog): Promise<TaskLog> {
-    const connection = await this.ensureConnection();
+    const dbLog = taskLogToDbLog(log);
+    const { data, error } = await supabase
+      .from('task_logs')
+      .insert(dbLog)
+      .select()
+      .single();
 
-    return new Promise((resolve, reject) => {
-      const stmt = connection.db.prepare(`
-        INSERT INTO task_logs (id, taskId, message, timestamp, isEditable)
-        VALUES (?, ?, ?, ?, ?)
-      `);
+    if (error) {
+      throw new Error(`Failed to add task log: ${error.message}`);
+    }
 
-      stmt.run([
-        log.id,
-        log.taskId,
-        log.message,
-        log.timestamp,
-        log.isEditable
-      ], function (err) {
-        stmt.finalize();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(log);
-        }
-      });
-    });
+    return dbLogToTaskLog(data);
   }
 
   async updateTaskLog(logId: string, message: string): Promise<boolean> {
-    const connection = await this.ensureConnection();
+    const { error } = await supabase
+      .from('task_logs')
+      .update({ message })
+      .eq('id', logId);
 
-    return new Promise((resolve, reject) => {
-      const stmt = connection.db.prepare(`
-        UPDATE task_logs SET message = ? WHERE id = ?
-      `);
+    if (error) {
+      throw new Error(`Failed to update task log: ${error.message}`);
+    }
 
-      stmt.run([message, logId], function (err) {
-        stmt.finalize();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(this.changes > 0);
-        }
-      });
-    });
+    return true;
   }
 
   async deleteTaskLog(logId: string): Promise<boolean> {
-    const connection = await this.ensureConnection();
+    const { error } = await supabase
+      .from('task_logs')
+      .delete()
+      .eq('id', logId);
 
-    return new Promise((resolve, reject) => {
-      const stmt = connection.db.prepare(`
-        DELETE FROM task_logs WHERE id = ?
-      `);
+    if (error) {
+      throw new Error(`Failed to delete task log: ${error.message}`);
+    }
 
-      stmt.run([logId], function (err) {
-        stmt.finalize();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(this.changes > 0);
-        }
-      });
-    });
+    return true;
   }
 
   // Helper methods for specific operations
@@ -273,13 +242,6 @@ class TaskDatabase {
       completedTime
     });
   }
-
-  async close() {
-    if (this.connection) {
-      await this.connection.close();
-      this.connection = null;
-    }
-  }
 }
 
 // Singleton instance
@@ -294,9 +256,8 @@ export function getDatabase(): TaskDatabase {
 
 // Export functions for API routes
 export async function initDatabase() {
-  const db = getDatabase();
-  // Ensure database is initialized
-  await db.initializeDatabase();
+  // No initialization needed for Supabase - client handles connection
+  return;
 }
 
 export async function getAllTasks(): Promise<TaskWithLogs[]> {
